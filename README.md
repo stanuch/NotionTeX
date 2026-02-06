@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Notion-Inline-Math-Assistant_logo.png" width="400" alt="Notion Inline Math Assistant Logo">
+  <img src="assets/Notion-Inline-Math-Assistant_logo.png" width="500" alt="Notion Inline Math Assistant Logo">
 </p>
 
 A Chrome extension that converts LaTeX-style math notation (`$...$` and `$$...$$`) into native Notion inline equations. Notion supports inline equations, but entering them requires navigating menus or using slash commands. This extension allows you to quickly convert math written in LaTeX format to native Notion equations with a single keyboard shortcut.
