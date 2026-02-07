@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Notion Math Assistant",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Seamlessly converts LaTeX-style math into native Notion inline and block equations.",
   "minimum_chrome_version": "109",
   "icons": {

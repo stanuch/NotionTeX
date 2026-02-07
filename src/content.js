@@ -419,8 +419,27 @@ async function deleteSelection() {
   await sleep(10);
 }
 
-// MACRO ENGINE - Automated equation insertion via slash commands
 async function runMacro(latex, command) {
+  let insertedSpaceInNode = null;
+
+  // Get the text before cursor to check if it needs space
+  const sel = window.getSelection();
+  if (sel.rangeCount > 0) {
+    const range = sel.getRangeAt(0);
+    const node = range.startContainer;
+    const offset = range.startOffset;
+
+    if (node.nodeType === Node.TEXT_NODE && offset > 0) {
+      const charBefore = node.nodeValue.charAt(offset - 1);
+      if (charBefore && !/\s/.test(charBefore)) {
+        // Remember where we're inserting the space
+        insertedSpaceInNode = node;
+        document.execCommand("insertText", false, " ");
+        await sleep(10);
+      }
+    }
+  }
+
   document.execCommand("insertText", false, command);
   await sleep(DELAY.MENU_WAIT);
 
@@ -434,6 +453,49 @@ async function runMacro(latex, command) {
     await sleep(DELAY.TYPING);
     dispatchKey(active, "Enter", "Enter", 13);
     await sleep(50);
+
+    // Clean up the extra space we inserted
+    if (insertedSpaceInNode) {
+      await sleep(20);
+      try {
+        // The equation replaced the slash command, so the space should now be
+        // at the end of the original text node (which is now before the equation)
+        // Or it might be in a different text node. Let's find it by looking
+        // at the cursor position and working backwards.
+        const sel2 = window.getSelection();
+        if (sel2.rangeCount > 0) {
+          const range2 = sel2.getRangeAt(0);
+          let searchNode = range2.startContainer;
+
+          // Walk backwards through siblings to find a text node with trailing space
+          if (searchNode.nodeType !== Node.TEXT_NODE) {
+            // We might be inside an element, look at previous sibling
+            searchNode = searchNode.previousSibling || searchNode.parentNode?.previousSibling;
+          }
+
+          // Check the previous sibling of the equation (which should be before cursor)
+          let prevNode = searchNode?.previousSibling;
+          while (prevNode) {
+            if (prevNode.nodeType === Node.TEXT_NODE && prevNode.nodeValue?.endsWith(' ')) {
+              prevNode.nodeValue = prevNode.nodeValue.slice(0, -1);
+              break;
+            }
+            // Check inside element for text node
+            if (prevNode.nodeType === Node.ELEMENT_NODE) {
+              const lastText = prevNode.lastChild;
+              if (lastText?.nodeType === Node.TEXT_NODE && lastText.nodeValue?.endsWith(' ')) {
+                lastText.nodeValue = lastText.nodeValue.slice(0, -1);
+                break;
+              }
+            }
+            prevNode = prevNode.previousSibling;
+          }
+        }
+      } catch (e) {
+        // Silently fail - the space is a minor cosmetic issue
+      }
+    }
+
     return true;
   }
   return false;
