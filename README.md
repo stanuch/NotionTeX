@@ -10,6 +10,11 @@ A Chrome extension that converts LaTeX-style math notation (`$...$` for inline a
 ![Manifest](https://img.shields.io/badge/Manifest-V3-2ea44f?logo=google-chrome&logoColor=white)
 ![AI Assisted](https://img.shields.io/badge/Built_with-AI-blueviolet?style=flat)
 
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/ec9a2651-ff92-4390-be0c-c288ce50515e" width="100%" controls="controls" muted="muted" autoplay="autoplay">
+  </video>
+</div>
+
 ## Features
 
 - **Dual Equation Support**: Converts both inline (`$...$`) and block (`$$...$$`) equations
