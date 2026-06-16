@@ -4,11 +4,17 @@
 
 A Chrome extension that converts LaTeX-style math notation (`$...$` for inline and `$$...$$` for block equations) into native Notion equations. Notion supports equations natively, but entering them requires navigating menus or using slash commands. This extension streamlines the workflow by allowing you to write math in familiar LaTeX syntax and convert it with a single action.
 
+![Latest Release](https://img.shields.io/github/v/release/stanuch/NotionTeX?label=Latest%20Release)
+![Codebase Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fstanuch%2FNotionTeX%2Fmain%2Fmanifest.json&query=%24.version&label=Codebase%20Version&color=blue)
+![Release Date](https://img.shields.io/github/release-date/stanuch/NotionTeX?label=Latest%20Release)
+![Newest commit](https://img.shields.io/github/last-commit/stanuch/NotionTeX?label=Newest%20Commit)
 ![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
 ![Notion](https://img.shields.io/badge/Notion-000000?logo=notion&logoColor=white)
 ![Chrome](https://img.shields.io/badge/Chrome_Extension-4285F4?logo=google-chrome&logoColor=white)
 ![Manifest](https://img.shields.io/badge/Manifest-V3-2ea44f?logo=google-chrome&logoColor=white)
 ![AI Assisted](https://img.shields.io/badge/Built_with-AI-blueviolet?style=flat)
+
+> **Note:** The **Codebase Version** reflects the most recent updates on the `main` branch (which you get by downloading the repository directly), and it might be newer than the **Latest Release** version if I haven't published a new release yet.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/ec9a2651-ff92-4390-be0c-c288ce50515e" width="100%" controls="controls" muted="muted" autoplay="autoplay">
