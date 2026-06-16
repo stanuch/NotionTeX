@@ -1,6 +1,8 @@
 async function run(tabId) {
   if (!tabId) return;
-  chrome.tabs.sendMessage(tabId, { t: "RUN_CONVERT" });
+  chrome.tabs.sendMessage(tabId, { t: "RUN_CONVERT" }).catch(() => {
+    // Ignore error if content script is not loaded or receiving end does not exist
+  });
 }
 
 chrome.commands.onCommand.addListener(async c => {
@@ -20,7 +22,7 @@ chrome.runtime.onInstalled.addListener(() => {
     id: "convert_inline_equations",
     title: "Convert $…$ to inline equations",
     contexts: ["all"],
-    documentUrlPatterns: ["https://www.notion.so/*", "https://*.notion.site/*"]
+    documentUrlPatterns: ["https://notion.so/*", "https://www.notion.so/*", "https://*.notion.site/*", "https://*.notion.com/*"]
   });
 });
 

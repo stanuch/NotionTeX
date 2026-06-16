@@ -1,73 +1,169 @@
-// CONFIGURATION
+// ===== CONFIGURATION =====
 const ROOTS = [".notion-page-content", ".notion-frame", "main", "body"];
 const HUD_Z = 2147483646;
-const STORAGE_KEY = "notion-math-assistant-settings";
+console.log("[NotionTeX] Content script loaded");
 
-// Default delays (can be adjusted by user)
-const DEFAULT_DELAY = {
-  MENU_WAIT: 100,
-  INPUT_WAIT: 50,
-  TYPING: 10
+// Maximum wait times for DOM-based waiting (replaces fixed sleep delays)
+const TIMEOUTS = {
+  MENU: 5000,       // Wait for Notion slash menu to appear
+  INPUT: 5000,      // Wait for equation input field to appear
+  EQUATION: 3000,   // Wait for equation element after submit
+  UNDO_STEP: 50,    // Delay between undo operations
+  POLL: 50,         // Polling interval for DOM checks
 };
-
-// Delay presets for different computer speeds
-const DELAY_PRESETS = {
-  fast: { MENU_WAIT: 50, INPUT_WAIT: 25, TYPING: 5, label: "Fast", desc: "For fast computers" },
-  normal: { MENU_WAIT: 100, INPUT_WAIT: 50, TYPING: 10, label: "Normal", desc: "Default speed" },
-  slow: { MENU_WAIT: 200, INPUT_WAIT: 100, TYPING: 20, label: "Slow", desc: "For slower computers" },
-  slower: { MENU_WAIT: 400, INPUT_WAIT: 200, TYPING: 40, label: "Very Slow", desc: "If you experience issues" }
-};
-
-// Load saved settings or use defaults
-let DELAY = loadSettings();
-
-function loadSettings() {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      return { ...DEFAULT_DELAY, ...parsed };
-    }
-  } catch (e) { }
-  return { ...DEFAULT_DELAY };
-}
-
-function saveSettings() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(DELAY));
-  } catch (e) { }
-}
-
-function applyPreset(presetName) {
-  const preset = DELAY_PRESETS[presetName];
-  if (preset) {
-    DELAY.MENU_WAIT = preset.MENU_WAIT;
-    DELAY.INPUT_WAIT = preset.INPUT_WAIT;
-    DELAY.TYPING = preset.TYPING;
-    saveSettings();
-  }
-}
 
 let ignoredNodes = new WeakSet();
-let settingsOpen = false;
 
-// UTILITY FUNCTIONS
+// ===== CONVERSION LOG =====
+let conversionLog = [];
+
+function logConversion(original, latex, type, status, detail = "") {
+  conversionLog.push({ timestamp: Date.now(), original, latex, type, status, detail });
+}
+
+// ===== UTILITY FUNCTIONS =====
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const isEditable = el => !!el && (el.getAttribute("contenteditable") === "true" || el.isContentEditable);
+async function waitForCondition(conditionFn, timeout = 5000, pollInterval = 20) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (conditionFn()) return true;
+    await sleep(pollInterval);
+  }
+  return false;
+}
+
+const isEditable = el =>
+  !!el && (el.getAttribute("contenteditable") === "true" || el.isContentEditable);
 
 const isCodeCtx = el => el.closest?.(".notion-code-block, pre, code");
 
-function dispatchKey(el, key, code, keyCode) {
+function dispatchKey(el, key, code, keyCode, options = {}) {
   const ev = new KeyboardEvent("keydown", {
-    key: key, code: code, keyCode: keyCode, which: keyCode,
+    key, code, keyCode, which: keyCode,
+    bubbles: true, cancelable: true, view: window,
+    ...options
+  });
+  el.dispatchEvent(ev);
+}
+
+// --- DOM-based waiting (replaces all sleep(DELAY.*) calls) ---
+
+/**
+ * Wait for an element matching `selector` to appear in the DOM.
+ * Uses MutationObserver for efficiency instead of polling.
+ * Returns the element or null on timeout.
+ */
+async function waitForElement(selector, timeout = 5000) {
+  return new Promise(resolve => {
+    const existing = document.querySelector(selector);
+    if (existing) { resolve(existing); return; }
+
+    const observer = new MutationObserver(() => {
+      const el = document.querySelector(selector);
+      if (el) { observer.disconnect(); resolve(el); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
+  });
+}
+
+/**
+ * Wait for document.activeElement to change from `prev`.
+ * Used to detect when Notion opens the equation input field.
+ */
+async function waitForActiveElementChange(prev, timeout = 5000) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    const check = () => {
+      const active = document.activeElement;
+      if (active !== prev && active !== document.body) {
+        resolve(active);
+        return;
+      }
+      if (Date.now() - start > timeout) { resolve(null); return; }
+      requestAnimationFrame(check);
+    };
+    check();
+  });
+}
+
+/**
+ * Wait for a new child to appear in the Notion overlay container.
+ * This is a broader check for when specific menu selectors are unknown.
+ */
+async function waitForNewOverlay(timeout = 5000, extInitialCount = null) {
+  const container = document.querySelector(".notion-overlay-container");
+  const initialCount = extInitialCount !== null ? extInitialCount : (container ? container.children.length : 0);
+
+  return new Promise(resolve => {
+    const check = () => {
+      const c = document.querySelector(".notion-overlay-container");
+      if (c && c.children.length > initialCount) return true;
+      return false;
+    };
+    if (check()) { resolve(true); return; }
+
+    const observer = new MutationObserver(() => {
+      if (check()) { observer.disconnect(); resolve(true); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => { observer.disconnect(); resolve(false); }, timeout);
+  });
+}
+
+/**
+ * Rollback operations using Ctrl+Z (undo).
+ * Undoes `count` operations to restore the document to its previous state.
+ */
+async function undoOperations(count = 10) {
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  for (let i = 0; i < count; i++) {
+    // Prefer Notion's native React undo stack to prevent markdown parser bugs
+    const ev = new KeyboardEvent("keydown", {
+      key: "z", code: "KeyZ", keyCode: 90, which: 90,
+      ctrlKey: !isMac, metaKey: isMac,
+      bubbles: true, cancelable: true, view: window
+    });
+    const canceled = !document.activeElement.dispatchEvent(ev);
+    if (!canceled) {
+      document.execCommand("undo");
+    }
+    await sleep(TIMEOUTS.UNDO_STEP);
+  }
+}
+
+// ===== CONTEXT CAPTURE (punctuation protection) =====
+
+/**
+ * Captures the surrounding context of an equation before conversion.
+ * Used to verify that adjacent punctuation is preserved after conversion.
+ */
+function captureContext(tn, span) {
+  return {
+    fullText: tn.nodeValue,
+    charBefore: span.open > 0 ? tn.nodeValue.charAt(span.open - 1) : null,
+    charAfter: span.close < tn.nodeValue.length ? tn.nodeValue.charAt(span.close) : null,
+    latex: tn.nodeValue.substring(span.innerStart, span.innerEnd),
+    original: tn.nodeValue.substring(span.open, span.close),
+    isBlock: span.dbl,
+  };
+}
+
+function triggerInlineMath(el) {
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const ev = new KeyboardEvent("keydown", {
+    key: "e", code: "KeyE", keyCode: 69, which: 69,
+    ctrlKey: !isMac, metaKey: isMac, shiftKey: true,
     bubbles: true, cancelable: true, view: window
   });
   el.dispatchEvent(ev);
 }
 
-function closeNotionDialog() {
-  const buttons = document.querySelectorAll('.notion-overlay-container div[role="button"], .notion-overlay-container button');
+async function closeNotionDialog(isBlock) {
+  const buttons = document.querySelectorAll(
+    '.notion-overlay-container div[role="button"], .notion-overlay-container button'
+  );
   for (const btn of buttons) {
     if (btn.textContent === "Done" || btn.textContent === "Gotowe") {
       btn.click();
@@ -76,21 +172,37 @@ function closeNotionDialog() {
   }
 
   const active = document.activeElement;
+  if (isBlock && active) {
+    const prevActive = document.activeElement;
+    dispatchKey(active, "Escape", "Escape", 27);
+
+    // Wait dynamically for focus to leave the equation input
+    await waitForCondition(() => document.activeElement !== prevActive, 3000);
+
+    // Press Escape again to clear the block selection (blue outline)
+    // This prevents Notion from locking its internal focus on the closed block
+    dispatchKey(document.activeElement, "Escape", "Escape", 27);
+    await sleep(20);
+    return true;
+  }
+
   if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
     dispatchKey(active, "Enter", "Enter", 13);
     return true;
   }
 
-  document.body.click();
+  // Do not click document.body here, as it removes focus from the editor 
+  // and breaks React's state synchronization for the next equation.
   return false;
 }
 
-// TEXT SCANNING - Finding LaTeX expressions in the document
+// ===== TEXT SCANNING =====
+// (unchanged — finding LaTeX expressions in the document)
+
 function* textNodes(root) {
   const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(n) {
       if (!n.nodeValue || n.nodeValue.indexOf("$") === -1) return NodeFilter.FILTER_REJECT;
-      if (ignoredNodes.has(n)) return NodeFilter.FILTER_REJECT;
       if (!n.parentElement) return NodeFilter.FILTER_REJECT;
       if (isCodeCtx(n.parentElement)) return NodeFilter.FILTER_REJECT;
       if (n.closest?.(".notion-equation, .katex")) return NodeFilter.FILTER_REJECT;
@@ -133,13 +245,16 @@ function findDollarSpans(text) {
       }
     }
 
-    if (close === -1) { i = open + 1; continue; }
+    if (close === -1) { i = open + (dbl ? 2 : 1); continue; }
 
     const innerStart = open + openLen;
     const innerEnd = close - (dbl ? 2 : 1);
 
     if (innerEnd >= innerStart) {
-      spans.push({ open, innerStart, innerEnd, close, dbl });
+      const latex = text.substring(innerStart, innerEnd);
+      if (latex.trim().length > 0) {
+        spans.push({ open, innerStart, innerEnd, close, dbl });
+      }
     }
 
     i = close;
@@ -147,226 +262,59 @@ function findDollarSpans(text) {
   return spans;
 }
 
-// HUD
-function makeHUD() {
-  let hud = document.getElementById("eq-hud");
-  if (hud) return hud;
+// ===== EQUATION COLLECTION =====
 
-  hud = document.createElement("div");
-  hud.id = "eq-hud";
-  Object.assign(hud.style, {
-    position: "fixed", top: "16px", right: "16px",
-    background: "rgba(30, 30, 30, 0.95)",
-    color: "#fff",
-    font: "14px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-    borderRadius: "10px", zIndex: String(HUD_Z), pointerEvents: "none",
-    boxShadow: "0 6px 16px rgba(0,0,0,0.35)",
-    border: "1px solid rgba(255,255,255,0.1)",
-    minWidth: "280px", maxWidth: "400px", lineHeight: "1.5",
-    backdropFilter: "blur(6px)"
-  });
-  document.documentElement.appendChild(hud);
-  return hud;
-}
+function collectItems() {
+  const items = [];
+  const roots = new Set();
 
-function getCurrentPreset() {
-  for (const [name, preset] of Object.entries(DELAY_PRESETS)) {
-    if (DELAY.MENU_WAIT === preset.MENU_WAIT &&
-      DELAY.INPUT_WAIT === preset.INPUT_WAIT &&
-      DELAY.TYPING === preset.TYPING) {
-      return name;
+  for (const s of ROOTS) document.querySelectorAll(s).forEach(n => roots.add(n));
+  if (!roots.size) roots.add(document.body);
+
+  const visitedNodes = new Set();
+  for (const root of roots) {
+    for (const tn of textNodes(root)) {
+      if (visitedNodes.has(tn)) continue;
+      visitedNodes.add(tn);
+      const spans = findDollarSpans(tn.nodeValue);
+      spans.forEach(span => items.push({ tn, span }));
     }
   }
-  return "custom";
+  return items;
 }
 
-function showSettings() {
-  settingsOpen = true;
-  const hud = makeHUD();
-  hud.style.display = "block";
-  hud.style.padding = "16px 20px";
-  hud.style.pointerEvents = "auto";
+// ===== DOM MANIPULATION =====
 
-  const currentPreset = getCurrentPreset();
-
-  let presetsHTML = "";
-  for (const [name, preset] of Object.entries(DELAY_PRESETS)) {
-    const isActive = name === currentPreset;
-    const activeStyle = isActive
-      ? "background: #4ade80; color: #000; font-weight: 600;"
-      : "background: rgba(255,255,255,0.1);";
-    presetsHTML += `
-      <button data-preset="${name}" style="
-        ${activeStyle}
-        border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer;
-        font-size: 12px; transition: all 0.15s;
-      " onmouseover="this.style.opacity='0.8'" onmouseout="this.style.opacity='1'">
-        ${preset.label}
-      </button>`;
-  }
-
-  hud.innerHTML = `
-    <style>
-      .eq-settings-input { 
-        width: 60px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
-        border-radius: 4px; color: #fff; padding: 4px 8px; text-align: center; font-size: 12px;
-      }
-      .eq-settings-input:focus { outline: none; border-color: #4ade80; }
-      .eq-settings-row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; }
-      .eq-settings-label { font-size: 12px; color: #aaa; }
-    </style>
-    <div style="font-weight: 700; font-size: 15px; margin-bottom: 12px; color: #4ade80;">
-      ⚙️ Speed Settings
-    </div>
-    <div style="font-size: 11px; color: #888; margin-bottom: 12px;">
-      Adjust timing for your computer speed
-    </div>
-    <div style="display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap;">
-      ${presetsHTML}
-    </div>
-    <div style="border-top: 1px solid rgba(255,255,255,0.1); padding-top: 12px;">
-      <div style="font-size: 11px; color: #888; margin-bottom: 8px;">Custom values (ms):</div>
-      <div class="eq-settings-row">
-        <span class="eq-settings-label">Menu Wait</span>
-        <input type="number" class="eq-settings-input" id="eq-menu-wait" value="${DELAY.MENU_WAIT}" min="10" max="1000" step="10">
-      </div>
-      <div class="eq-settings-row">
-        <span class="eq-settings-label">Input Wait</span>
-        <input type="number" class="eq-settings-input" id="eq-input-wait" value="${DELAY.INPUT_WAIT}" min="10" max="500" step="10">
-      </div>
-      <div class="eq-settings-row">
-        <span class="eq-settings-label">Typing</span>
-        <input type="number" class="eq-settings-input" id="eq-typing" value="${DELAY.TYPING}" min="5" max="100" step="5">
-      </div>
-    </div>
-    <div style="margin-top: 16px; display: flex; gap: 8px;">
-      <button id="eq-save-settings" style="
-        flex: 1; background: #4ade80; color: #000; border: none; padding: 8px; 
-        border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px;
-      ">Save & Close</button>
-      <button id="eq-cancel-settings" style="
-        background: rgba(255,255,255,0.1); color: #fff; border: none; padding: 8px 16px;
-        border-radius: 6px; cursor: pointer; font-size: 13px;
-      ">Cancel</button>
-    </div>
-  `;
-
-  // Add event listeners
-  setTimeout(() => {
-    // Preset buttons
-    hud.querySelectorAll("[data-preset]").forEach(btn => {
-      btn.addEventListener("click", () => {
-        applyPreset(btn.dataset.preset);
-        showSettings(); // Refresh UI
-      });
-    });
-
-    // Save button
-    document.getElementById("eq-save-settings")?.addEventListener("click", () => {
-      DELAY.MENU_WAIT = parseInt(document.getElementById("eq-menu-wait")?.value) || 100;
-      DELAY.INPUT_WAIT = parseInt(document.getElementById("eq-input-wait")?.value) || 50;
-      DELAY.TYPING = parseInt(document.getElementById("eq-typing")?.value) || 10;
-      saveSettings();
-      settingsOpen = false;
-      hud.style.pointerEvents = "none";
-      if (guide && guide.items.length > 0) {
-        // Just refresh the HUD without rescanning - stay on current equation
-        const item = guide.items[guide.index];
-        if (item) {
-          const isBlock = item.span.dbl;
-          updateHUD(guide.index, guide.items.length, isBlock, guide.autoMode);
-        }
-      } else {
-        hideHUD();
-      }
-    });
-
-    // Cancel button
-    document.getElementById("eq-cancel-settings")?.addEventListener("click", () => {
-      settingsOpen = false;
-      hud.style.pointerEvents = "none";
-      if (guide && guide.items.length > 0) {
-        // Just refresh the HUD without rescanning - stay on current equation
-        const item = guide.items[guide.index];
-        if (item) {
-          const isBlock = item.span.dbl;
-          updateHUD(guide.index, guide.items.length, isBlock, guide.autoMode);
-        }
-      } else {
-        hideHUD();
-      }
-    });
-
-    // Input change handlers
-    ["eq-menu-wait", "eq-input-wait", "eq-typing"].forEach(id => {
-      document.getElementById(id)?.addEventListener("change", (e) => {
-        // Visual feedback that custom is selected
-        hud.querySelectorAll("[data-preset]").forEach(btn => {
-          btn.style.background = "rgba(255,255,255,0.1)";
-          btn.style.color = "#fff";
-          btn.style.fontWeight = "normal";
-        });
-      });
-    });
-  }, 0);
+function focusEditableFrom(node) {
+  let el = node.parentElement;
+  while (el && !isEditable(el)) el = el.parentElement;
+  if (el) { el.focus({ preventScroll: true }); return el; }
+  return null;
 }
 
-function updateHUD(current, total, isBlock, autoMode) {
-  if (settingsOpen) return;
-
-  const hud = makeHUD();
-  hud.style.display = "block";
-  hud.style.padding = "16px 20px";
-  hud.style.pointerEvents = "none";
-
-  const cmd = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
-  const typeLabel = isBlock ? "Block Equation ($$)" : "Inline Equation ($)";
-  const typeColor = isBlock ? "#60a5fa" : "#4ade80";
-
-  // Get current speed preset name
-  const currentPreset = getCurrentPreset();
-  const speedLabel = currentPreset === "custom" ? "Custom" : DELAY_PRESETS[currentPreset]?.label || "Normal";
-
-  let instruction = "";
-  if (autoMode) {
-    instruction = `<span style="color:#fbbf24; animation: pulse 0.5s infinite;">⚡ Auto-Running...</span>`;
-  } else {
-    instruction = `Press <b style="color:#fff; border-bottom:1px solid #aaa">${cmd}+Shift+E</b>`;
-  }
-
-  hud.innerHTML =
-    `<style>@keyframes pulse { 0% {opacity:1;} 50% {opacity:0.5;} 100% {opacity:1;} }</style>` +
-    `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:20px;">
-       <span style="font-weight:700; font-size:15px; color:${typeColor}; white-space:nowrap;">${typeLabel}</span>
-       <div style="display:flex; gap:8px; align-items:center;">
-         <span style="font-size:10px; color:#888; background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:4px;">⚡${speedLabel}</span>
-         <span style="font-size:12px; font-weight:600; opacity:0.9; background:rgba(255,255,255,0.15); padding:3px 10px; border-radius:12px; font-variant-numeric: tabular-nums;">
-           ${current + 1} / ${total}
-         </span>
-       </div>
-     </div>` +
-    `<div style="font-size:13px; opacity:0.9; margin-bottom:6px;">${instruction}</div>` +
-    `<div style="font-size:12px; color:#bbb; margin-top:10px; display:flex; gap:15px; font-weight:500;">
-       <span><b style="color:#fff">A</b>: Auto</span> <span>➡ Skip</span> <span><b style="color:#fff">S</b>: Speed</span> <span>ESC: Exit</span>
-     </div>`;
+function setSelectionInTextNode(node, start, end) {
+  const sel = window.getSelection();
+  const r = document.createRange();
+  try {
+    r.setStart(node, start);
+    r.setEnd(node, end);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  } catch (e) { return null; }
+  return r;
 }
 
-function showNotification(text, isError = false) {
-  const hud = makeHUD();
-  hud.style.display = "block";
-  hud.style.padding = "12px 16px";
-  const icon = isError ? "❗" : "ℹ️";
-  hud.innerHTML =
-    `<div style="display:flex; align-items:center; gap:12px; padding:2px 0;">
-       <span style="font-size:22px; line-height:1;">${icon}</span>
-       <span style="font-weight:600; font-size:14px; color:#fff;">${text}</span>
-     </div>`;
-  setTimeout(() => { if (!guide) hideHUD(); }, 2000);
+async function deleteSelection() {
+  document.execCommand?.("delete");
+  const a = document.activeElement;
+  a?.dispatchEvent(new InputEvent("input", {
+    bubbles: true, cancelable: true, inputType: "deleteContent"
+  }));
+  await sleep(10);
 }
 
-const hideHUD = () => { const h = document.getElementById("eq-hud"); if (h) h.style.display = "none"; };
+// ===== VISUAL HIGHLIGHTING =====
 
-// VISUAL HIGHLIGHTING - Shows which equation is currently selected
 function highlightSelection(range, color = "#4ade80") {
   let box = document.getElementById("eq-box");
   if (!box) {
@@ -390,346 +338,604 @@ function highlightSelection(range, color = "#4ade80") {
   });
 }
 
-const hideHighlight = () => { const b = document.getElementById("eq-box"); if (b) b.style.display = "none"; };
+const hideHighlight = () => {
+  const b = document.getElementById("eq-box"); if (b) b.style.display = "none";
+};
 
-// DOM MANIPULATION - Text selection and editing
-function focusEditableFrom(node) {
-  let el = node.parentElement;
-  while (el && !isEditable(el)) el = el.parentElement;
-  if (el) { el.focus({ preventScroll: true }); return el; }
-  return null;
+// ===== HUD =====
+
+function makeHUD() {
+  let hud = document.getElementById("eq-hud");
+  if (hud) return hud;
+
+  hud = document.createElement("div");
+  hud.id = "eq-hud";
+  Object.assign(hud.style, {
+    position: "fixed", top: "16px", right: "16px",
+    background: "rgba(30, 30, 30, 0.95)",
+    color: "#fff",
+    font: "14px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    borderRadius: "10px", zIndex: String(HUD_Z), pointerEvents: "none",
+    boxShadow: "0 6px 16px rgba(0,0,0,0.35)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    minWidth: "280px", maxWidth: "400px", lineHeight: "1.5",
+    backdropFilter: "blur(6px)"
+  });
+  document.documentElement.appendChild(hud);
+  return hud;
 }
 
-function setSelectionInTextNode(node, start, end) {
-  const sel = window.getSelection();
-  const r = document.createRange();
-  try {
-    r.setStart(node, start);
-    r.setEnd(node, end);
-    sel.removeAllRanges();
-    sel.addRange(r);
-  } catch (e) { return null; }
-  return r;
-}
+function updateHUD(current, total, isBlock, autoMode) {
+  const hud = makeHUD();
+  hud.style.display = "block";
+  hud.style.padding = "16px 20px";
+  hud.style.pointerEvents = "none";
 
-async function deleteSelection() {
-  document.execCommand?.("delete");
-  const a = document.activeElement;
-  a?.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "deleteContent" }));
-  await sleep(10);
-}
+  const cmd = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  const typeLabel = isBlock ? "Block Equation ($$)" : "Inline Equation ($)";
+  const typeColor = isBlock ? "#60a5fa" : "#4ade80";
 
-async function runMacro(latex, command) {
-  let insertedSpaceInNode = null;
-
-  // Get the text before cursor to check if it needs space
-  const sel = window.getSelection();
-  if (sel.rangeCount > 0) {
-    const range = sel.getRangeAt(0);
-    const node = range.startContainer;
-    const offset = range.startOffset;
-
-    if (node.nodeType === Node.TEXT_NODE && offset > 0) {
-      const charBefore = node.nodeValue.charAt(offset - 1);
-      if (charBefore && !/\s/.test(charBefore)) {
-        // Remember where we're inserting the space
-        insertedSpaceInNode = node;
-        document.execCommand("insertText", false, " ");
-        await sleep(10);
-      }
-    }
+  // Stats from conversion log
+  const successCount = conversionLog.filter(l => l.status === "success").length;
+  const failCount = conversionLog.filter(l => l.status === "rollback").length;
+  let statsHTML = "";
+  if (successCount > 0 || failCount > 0) {
+    statsHTML = `<span style="font-size:10px; color:#888; background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:4px;">` +
+      `✅${successCount}` + (failCount > 0 ? ` ⚠️${failCount}` : "") + `</span>`;
   }
 
-  document.execCommand("insertText", false, command);
-  await sleep(DELAY.MENU_WAIT);
+  let instruction = "";
+  if (autoMode) {
+    instruction = `<span style="color:#fbbf24; animation: pulse 0.5s infinite;">⚡ Auto-Running...</span>`;
+  } else {
+    instruction = `Press <b style="color:#fff; border-bottom:1px solid #aaa">C</b> to convert`;
+  }
 
-  let active = document.activeElement;
-  dispatchKey(active, "Enter", "Enter", 13);
-  await sleep(DELAY.INPUT_WAIT);
+  hud.innerHTML =
+    `<style>@keyframes pulse { 0% {opacity:1;} 50% {opacity:0.5;} 100% {opacity:1;} }</style>` +
+    `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:20px;">
+       <span style="font-weight:700; font-size:15px; color:${typeColor}; white-space:nowrap;">${typeLabel}</span>
+       <div style="display:flex; gap:8px; align-items:center;">
+         ${statsHTML}
+         <span style="font-size:12px; font-weight:600; opacity:0.9; background:rgba(255,255,255,0.15); padding:3px 10px; border-radius:12px; font-variant-numeric: tabular-nums;">
+           ${total - current} eq left
+         </span>
+       </div>
+     </div>` +
+    `<div style="font-size:13px; opacity:0.9; margin-bottom:6px;">${instruction}</div>` +
+    `<div style="font-size:12px; color:#bbb; margin-top:10px; display:flex; gap:15px; font-weight:500;">
+       <span><b style="color:#fff">C</b>: Convert</span> <span><b style="color:#fff">A</b>: Auto</span> <span>➡ Skip</span> <span>ESC: Exit</span>
+     </div>`;
+}
 
-  active = document.activeElement;
-  if (active) {
-    document.execCommand("insertText", false, latex);
-    await sleep(DELAY.TYPING);
-    dispatchKey(active, "Enter", "Enter", 13);
-    await sleep(50);
+function showNotification(text, isError = false) {
+  const hud = makeHUD();
+  hud.style.display = "block";
+  hud.style.padding = "12px 16px";
+  hud.style.pointerEvents = isError ? "auto" : "none";
+  const icon = isError ? "❗" : "ℹ️";
+  hud.innerHTML =
+    `<div style="display:flex; align-items:center; gap:12px; padding:2px 0;">
+       <span style="font-size:22px; line-height:1;">${icon}</span>
+       <span style="font-weight:600; font-size:14px; color:#fff;">${text}</span>
+     </div>`;
+  setTimeout(() => { if (!guide) hideHUD(); }, 2000);
+}
 
-    // Clean up the extra space we inserted
-    if (insertedSpaceInNode) {
-      await sleep(20);
-      try {
-        // The equation replaced the slash command, so the space should now be
-        // at the end of the original text node (which is now before the equation)
-        // Or it might be in a different text node. Let's find it by looking
-        // at the cursor position and working backwards.
-        const sel2 = window.getSelection();
-        if (sel2.rangeCount > 0) {
-          const range2 = sel2.getRangeAt(0);
-          let searchNode = range2.startContainer;
+function showConversionReport() {
+  const hud = makeHUD();
+  hud.style.display = "block";
+  hud.style.padding = "16px 20px";
+  hud.style.pointerEvents = "none";
 
-          // Walk backwards through siblings to find a text node with trailing space
-          if (searchNode.nodeType !== Node.TEXT_NODE) {
-            // We might be inside an element, look at previous sibling
-            searchNode = searchNode.previousSibling || searchNode.parentNode?.previousSibling;
-          }
+  const success = conversionLog.filter(l => l.status === "success").length;
+  const skipped = conversionLog.filter(l => l.status === "skipped").length;
+  const rolled = conversionLog.filter(l => l.status === "rollback");
 
-          // Check the previous sibling of the equation (which should be before cursor)
-          let prevNode = searchNode?.previousSibling;
-          while (prevNode) {
-            if (prevNode.nodeType === Node.TEXT_NODE && prevNode.nodeValue?.endsWith(' ')) {
-              prevNode.nodeValue = prevNode.nodeValue.slice(0, -1);
-              break;
-            }
-            // Check inside element for text node
-            if (prevNode.nodeType === Node.ELEMENT_NODE) {
-              const lastText = prevNode.lastChild;
-              if (lastText?.nodeType === Node.TEXT_NODE && lastText.nodeValue?.endsWith(' ')) {
-                lastText.nodeValue = lastText.nodeValue.slice(0, -1);
-                break;
-              }
-            }
-            prevNode = prevNode.previousSibling;
-          }
-        }
-      } catch (e) {
-        // Silently fail - the space is a minor cosmetic issue
-      }
+  let rolledHTML = "";
+  if (rolled.length > 0) {
+    const details = rolled.map(r =>
+      `<div style="font-size:11px; color:#fca5a5; margin-top:4px; word-break:break-all;">
+         <code style="background:rgba(255,255,255,0.08); padding:1px 4px; border-radius:3px;">${r.original}</code>
+         <span style="color:#888;"> — ${r.detail}</span>
+       </div>`
+    ).join("");
+    rolledHTML = `<div style="margin-top:8px; border-top:1px solid rgba(255,255,255,0.1); padding-top:8px;">
+      <div style="font-size:11px; color:#fca5a5; font-weight:600;">Failed equations:</div>
+      ${details}
+    </div>`;
+  }
+
+  const allGood = rolled.length === 0;
+  const titleColor = allGood ? "#4ade80" : "#fbbf24";
+  const titleIcon = allGood ? "✅" : "⚠️";
+
+  hud.innerHTML =
+    `<div style="font-weight:700; font-size:15px; color:${titleColor}; margin-bottom:10px;">
+       ${titleIcon} Conversion Complete
+     </div>
+     <div style="display:flex; gap:16px; font-size:13px; margin-bottom:4px;">
+       <span style="color:#4ade80;">✅ Converted: ${success}</span>
+       <span style="color:#888;">⏭ Skipped: ${skipped}</span>
+       ${rolled.length > 0 ? `<span style="color:#fca5a5;">⚠️ Rolled back: ${rolled.length}</span>` : ""}
+     </div>
+     ${rolledHTML}`;
+
+  setTimeout(hideHUD, rolled.length > 0 ? 8000 : 3000);
+}
+
+const hideHUD = () => {
+  const h = document.getElementById("eq-hud"); if (h) h.style.display = "none";
+};
+
+// ===== CONVERSION LOGIC =====
+
+/**
+ * Core conversion function. Replaces the old runMacro().
+ * Handles the full lifecycle: select → delete → slash command → verify.
+ * All operations are tracked for undo-based rollback on failure.
+ *
+ * @param {Node} tn - The text node containing the equation
+ * @param {object} span - The span object from findDollarSpans
+ * @returns {{ success: boolean, reason?: string }}
+ */
+async function convertEquation(tn, span) {
+  const latex = tn.nodeValue.substring(span.innerStart, span.innerEnd);
+  const isBlock = span.dbl;
+  const command = isBlock ? "/math" : "/inlinemath";
+  let inputField = null;
+  let insertedSpace = false;
+  let undoCount = 0;
+  let pivotUndoCount = 0;
+
+  // Helper to force Notion's React state to recognize the block as active
+  function activateNode(node) {
+    const mousedown = new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window });
+    const mouseup = new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window });
+    node.dispatchEvent(mousedown);
+    node.dispatchEvent(mouseup);
+
+    let ceNode = node;
+    while (ceNode && !ceNode.isContentEditable) {
+      ceNode = ceNode.parentElement;
+    }
+    if (ceNode) ceNode.focus();
+  }
+
+  if (!isBlock) {
+    // INLINE MATH: Wrap selection with Ctrl+Shift+E, then overwrite
+    activateNode(tn.parentElement);
+    const r = setSelectionInTextNode(tn, span.open, span.close);
+    if (!r) return { success: false, reason: "selection_failed" };
+
+    const prevActive = document.activeElement;
+    triggerInlineMath(prevActive);
+
+    inputField = await waitForActiveElementChange(prevActive, TIMEOUTS.INPUT);
+    if (!inputField) {
+      await undoOperations(1);
+      return { success: false, reason: "input_timeout" };
     }
 
-    return true;
+    // Select all inside the equation editor to overwrite the original text (including $)
+    inputField.focus();
+    if (typeof inputField.select === "function") inputField.select();
+    document.execCommand("selectAll");
+    await sleep(20);
+
+    document.execCommand("insertText", false, latex);
+    undoCount++;
+
+    await sleep(50);
+    dispatchKey(inputField, "Enter", "Enter", 13);
+    await sleep(50);
+
+  } else {
+    // BLOCK MATH
+
+    activateNode(tn.parentElement);
+    await waitForCondition(() => document.activeElement && document.activeElement.contains(tn.parentElement), 2000);
+    await sleep(20); // Wait for React to complete its async focus-restore
+
+    // Dispatch a harmless key to wake up Notion's event listeners
+    dispatchKey(document.activeElement, "Shift", "ShiftLeft", 16);
+    await sleep(10);
+
+    const r = setSelectionInTextNode(tn, span.open, span.close);
+    if (!r) return { success: false, reason: "selection_failed" };
+
+    // Force React to recognize the new native DOM selection
+    document.dispatchEvent(new Event("selectionchange"));
+    if (tn.parentElement) {
+      tn.parentElement.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+    }
+    await sleep(30); // Wait for React to digest the selection change
+
+    let prefix = "/";
+    if (span.open > 0) {
+      // First explicitly delete the selected $$...$$ so Notion's native DOM state updates
+      document.execCommand("delete");
+      await sleep(40);
+      
+      // Now press Enter to split the block. This moves the cursor to a fresh line perfectly ready for '/'.
+      dispatchKey(document.activeElement, "Enter", "Enter", 13);
+      await sleep(150);
+      undoCount += 2; // delete, then enter
+    }
+
+    const initialOverlays = document.querySelectorAll('.notion-overlay-container').length;
+
+    // OVERWRITE the original equation directly with the slash trigger.
+    document.execCommand("insertText", false, prefix);
+    undoCount++;
+
+    // Wait for the slash menu to actually open!
+    const menuAppeared = await waitForNewOverlay(TIMEOUTS.MENU, initialOverlays);
+    if (!menuAppeared) {
+      await undoOperations(undoCount);
+      return { success: false, reason: "menu_timeout" };
+    }
+
+    // Now type the rest of the command to filter the menu
+    document.execCommand("insertText", false, "block eq");
+    undoCount++;
+
+    // Give Notion a fast, reliable moment to filter the slash menu
+    await sleep(400);
+
+    let beforeEnterActive = document.activeElement;
+    dispatchKey(beforeEnterActive, "Enter", "Enter", 13);
+
+    inputField = await waitForActiveElementChange(beforeEnterActive, TIMEOUTS.INPUT);
+    if (!inputField) {
+      await undoOperations(undoCount);
+      return { success: false, reason: "input_timeout" };
+    }
+
+    await sleep(150);
+
+    const cleanLatex = latex.trim();
+
+    inputField.focus();
+    if (typeof inputField.select === "function") inputField.select();
+    document.execCommand("selectAll");
+    await sleep(20);
+
+    if (cleanLatex.includes('\n')) {
+      const lines = cleanLatex.replace(/\r/g, '').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].length > 0) {
+          document.execCommand("insertText", false, lines[i]);
+        }
+        if (i < lines.length - 1) {
+          dispatchKey(inputField, "Enter", "Enter", 13, { shiftKey: true });
+          await sleep(20);
+        }
+      }
+    } else {
+      document.execCommand("insertText", false, cleanLatex);
+    }
+
+    undoCount++;
+    await sleep(50);
+  }
+
+  await closeNotionDialog(isBlock);
+  await sleep(20); // Give Notion time to fully blur the block
+
+  // Step 10: Verify the equation was actually created
+  const verified = await verifyEquationCreated(inputField);
+  if (!verified) {
+    // Extra undo operations for safety (Notion may have done internal ops)
+    await undoOperations(undoCount + pivotUndoCount + 5);
+    return { success: false, reason: "verify_failed" };
+  }
+
+  // Step 11: Clean up the inserted space (if we added one)
+  if (insertedSpace) {
+    await cleanupInsertedSpace();
+  }
+
+  return { success: true };
+}
+
+/**
+ * Verify that an equation element was created after conversion.
+ * Checks if the equation input field closed (meaning Notion accepted the input).
+ * Also looks for .katex or .notion-equation near cursor as secondary check.
+ */
+async function verifyEquationCreated(inputField, timeout) {
+  timeout = timeout || TIMEOUTS.EQUATION;
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    const active = document.activeElement;
+
+    // Primary signal: equation input is no longer focused
+    if (active !== inputField) {
+      // Secondary: check if focus returned to an editable area
+      if (isEditable(active) || active === document.body) {
+        // Optional: look for equation element nearby
+        await sleep(50);
+        return true;
+      }
+    }
+    await sleep(TIMEOUTS.POLL);
   }
   return false;
 }
 
-// EQUATION COLLECTION - Finding all equations in the document
-function collectItems() {
-  const items = [];
-  const roots = new Set();
+/**
+ * Remove the space that was inserted before the slash command.
+ * Uses execCommand('delete') to stay compatible with Notion's undo stack.
+ * (Replaces old nodeValue manipulation which bypassed undo and could corrupt text.)
+ */
+async function cleanupInsertedSpace() {
+  try {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return;
 
-  for (const s of ROOTS) document.querySelectorAll(s).forEach(n => roots.add(n));
-  if (!roots.size) roots.add(document.body);
+    let node = sel.getRangeAt(0).startContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
 
-  const visitedNodes = new Set();
-  for (const root of roots) {
-    for (const tn of textNodes(root)) {
-      if (visitedNodes.has(tn)) continue;
-      visitedNodes.add(tn);
-      const spans = findDollarSpans(tn.nodeValue);
-      spans.forEach(span => items.push({ tn, span }));
+    const block = node.closest('.notion-text-block, .notion-selectable') || document.body;
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null, false);
+
+    let current = walker.nextNode();
+    while (current) {
+      if (current.nodeValue.endsWith(" ")) {
+        // Check if the next element is an equation
+        let nextEl = current.nextSibling;
+        if (!nextEl && current.parentElement) {
+          nextEl = current.parentElement.nextSibling;
+        }
+
+        if (nextEl && nextEl.nodeType === Node.ELEMENT_NODE &&
+          (nextEl.classList.contains('notion-equation') || nextEl.classList.contains('katex') || nextEl.querySelector('.katex'))) {
+
+          const r = document.createRange();
+          r.setStart(current, current.nodeValue.length - 1);
+          r.setEnd(current, current.nodeValue.length);
+          const tempSel = window.getSelection();
+          tempSel.removeAllRanges();
+          tempSel.addRange(r);
+          document.execCommand("delete");
+          await sleep(10);
+          return;
+        }
+      }
+      current = walker.nextNode();
     }
+  } catch (e) {
+    // Space cleanup is non-critical
   }
-  return items;
 }
 
-// GUIDE STATE - Tracks the conversion session
-let guide = null;
+// ===== GUIDE STATE =====
 
-function stopGuide() {
+let guide = null;
+let isConverting = false;
+
+function stopGuide(showReport = false) {
   if (!guide) return;
-  hideHUD();
   hideHighlight();
   window.removeEventListener("keydown", onKey, true);
-  if (guide.checker) clearInterval(guide.checker);
   guide = null;
-  settingsOpen = false;
+
+  if (showReport && conversionLog.length > 0) {
+    showConversionReport();
+  } else {
+    hideHUD();
+  }
 }
 
-// MAIN CONVERSION LOGIC
+// ===== MAIN STEP LOGIC =====
+
+/**
+ * Simplified goStep — no manual mode (which was destructive).
+ * In non-auto mode: highlights the equation WITHOUT modifying DOM.
+ * Conversion only happens on explicit user action or auto mode.
+ */
 async function goStep(delta) {
   if (!guide) return;
 
-  if (guide.checker) clearInterval(guide.checker);
-
+  // Re-collect items (equations may have changed after previous conversion)
   const items = collectItems();
   guide.items = items;
 
   if (!items.length) {
-    stopGuide();
-    showNotification("All done!", false);
+    stopGuide(true);
+    if (conversionLog.length === 0) {
+      showNotification("All done!", false);
+    }
     return;
   }
 
   let i = guide.index + delta;
   if (i < 0) i = 0;
-  if (i >= items.length) i = items.length - 1;
+  if (i >= items.length) {
+    // Reached the end
+    stopGuide(true);
+    return;
+  }
 
   guide.index = i;
   const item = items[i];
   const { tn, span } = item;
 
-  if (!tn.isConnected || !focusEditableFrom(tn)) {
+  // Ensure the text node is still in the DOM
+  if (!tn.isConnected) {
     guide.index = 0;
     setTimeout(() => goStep(0), 10);
     return;
   }
 
-  item.span = span;
+  // Scroll into view if off-screen (prevents Notion from unmounting virtualized nodes during focus)
+  if (tn.parentElement) {
+    const rect = tn.parentElement.getBoundingClientRect();
+    const inView = rect.top >= 150 && rect.bottom <= window.innerHeight - 150;
+    if (!inView) {
+      tn.parentElement.scrollIntoView({ block: "center" });
+      await sleep(100); // Give Notion time to render virtualized lists
+
+      // After scrolling, React might have recreated the text node!
+      if (!tn.isConnected) {
+        setTimeout(() => goStep(0), 10);
+        return;
+      }
+    }
+  }
+
+  if (!focusEditableFrom(tn)) {
+    guide.index = 0;
+    setTimeout(() => goStep(0), 10);
+    return;
+  }
+
   const isBlock = span.dbl;
 
-  // AUTO MODE - Fully automatic conversion
+  // AUTO MODE — convert automatically
   if (guide.autoMode) {
-    const r = setSelectionInTextNode(tn, span.open, span.close);
-    if (!r) { setTimeout(() => goStep(1), 0); return; }
-
-    const color = isBlock ? "#60a5fa" : "#4ade80";
-    highlightSelection(r, color);
-    updateHUD(guide.index, items.length, isBlock, true);
-    await sleep(10);
-
-    const latex = tn.nodeValue.substring(span.innerStart, span.innerEnd);
-
-    await deleteSelection();
-    const command = isBlock ? "/math" : "/inlinemath";
-    const success = await runMacro(latex, command);
-
-    if (success) {
-      setTimeout(() => goStep(0), 10);
-    } else {
-      ignoredNodes.add(tn);
-      setTimeout(() => goStep(0), 50);
-    }
-    return;
-  }
-
-  // MANUAL MODE - Strip $ signs upfront, restore on ESC if no conversion
-  // Store info for potential restoration
-  const latex = tn.nodeValue.substring(span.innerStart, span.innerEnd);
-  const dollars = isBlock ? "$$" : "$";
-  guide.pendingRestore = { tn, latex, dollars, converted: false };
-
-  // Strip closing delimiter first (so positions stay valid)
-  setSelectionInTextNode(tn, span.innerEnd, span.close);
-  await deleteSelection();
-
-  // Strip opening delimiter
-  setSelectionInTextNode(tn, span.open, span.innerStart);
-  await deleteSelection();
-
-  // Select the inner LaTeX content
-  const innerLen = span.innerEnd - span.innerStart;
-  const rInner = setSelectionInTextNode(tn, span.open, span.open + innerLen);
-  if (!rInner) { setTimeout(() => goStep(1), 0); return; }
-
-  const color = isBlock ? "#60a5fa" : "#4ade80";
-  highlightSelection(rInner, color);
-  updateHUD(guide.index, items.length, isBlock, false);
-
-  // Store original text to detect when user converts
-  const originalText = tn.nodeValue;
-
-  // Monitor for conversion
-  guide.checker = setInterval(() => {
-    if (!tn.isConnected) {
-      clearInterval(guide.checker);
-      guide.checker = null;
-      guide.pendingRestore = null; // Conversion happened, no need to restore
-      setTimeout(() => {
-        closeNotionDialog();
-        setTimeout(() => goStep(0), 20);
-      }, 50);
+    if (isConverting) {
+      setTimeout(() => goStep(0), 100);
       return;
     }
+    isConverting = true;
 
-    if (tn.nodeValue !== originalText) {
-      clearInterval(guide.checker);
-      guide.checker = null;
-      guide.pendingRestore = null; // Conversion happened
-      setTimeout(() => {
-        closeNotionDialog();
-        setTimeout(() => goStep(0), 20);
-      }, 50);
+    try {
+      // Highlight briefly for visual feedback
+      const r = setSelectionInTextNode(tn, span.open, span.close);
+      if (!r) { setTimeout(() => goStep(0), 0); return; }
+
+      const color = isBlock ? "#60a5fa" : "#4ade80";
+      highlightSelection(r, color);
+      updateHUD(guide.index, items.length, isBlock, true);
+
+      // Wait for Notion's DOM to settle before manipulating the next equation in Auto Mode
+      await sleep(150);
+
+      // Capture context for punctuation protection
+      const context = captureContext(tn, span);
+
+      // convertEquation handles select → delete → convert → verify → rollback
+      const result = await convertEquation(tn, span);
+      if (!guide) return;
+
+      if (result.success) {
+        logConversion(context.original, context.latex, isBlock ? "block" : "inline", "success");
+        setTimeout(() => goStep(0), 10);
+      } else {
+        logConversion(context.original, context.latex, isBlock ? "block" : "inline", "rollback", result.reason);
+
+        // Stop auto mode on failure — don't risk further data loss
+        guide.autoMode = false;
+        showNotification(
+          `⚠️ Rollback: ${result.reason}<br>` +
+          `<div style="margin-top:10px; font-size:12px; color:#ddd;">Original text (copy if needed):</div>` +
+          `<textarea style="width:100%; height:60px; margin-top:4px; padding:6px; background:#333; color:#fff; border:1px solid #555; border-radius:4px; font-family:monospace; resize:vertical; user-select:text; -webkit-user-select:text; cursor:text;" onfocus="this.select()">${context.original}</textarea>`,
+          true
+        );
+      }
+    } finally {
+      isConverting = false;
     }
-  }, 50);
-}
-
-// KEYBOARD HANDLER
-function onKey(e) {
-  if (!guide) return;
-
-  // Allow typing in settings inputs
-  if (settingsOpen && (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON")) {
     return;
   }
+
+  // NON-AUTO MODE — just highlight, don't modify DOM
+  const r = setSelectionInTextNode(tn, span.open, span.close);
+  if (!r) { setTimeout(() => goStep(1), 0); return; }
+
+  const color = isBlock ? "#60a5fa" : "#4ade80";
+  highlightSelection(r, color);
+  updateHUD(guide.index, items.length, isBlock, false);
+}
+
+/**
+ * Convert the currently highlighted equation (triggered by Ctrl+Shift+E).
+ */
+async function convertCurrent() {
+  if (!guide || guide.autoMode || isConverting) return;
+
+  const item = guide.items[guide.index];
+  if (!item) return;
+
+  const { tn, span } = item;
+  if (!tn.isConnected) { goStep(0); return; }
+
+  isConverting = true;
+  try {
+    const isBlock = span.dbl;
+    const context = captureContext(tn, span);
+
+    // convertEquation handles select → delete → convert → verify → rollback
+    const result = await convertEquation(tn, span);
+
+    if (result.success) {
+      logConversion(context.original, context.latex, isBlock ? "block" : "inline", "success");
+      setTimeout(() => goStep(0), 10);
+    } else {
+      logConversion(context.original, context.latex, isBlock ? "block" : "inline", "rollback", result.reason);
+      showNotification(
+        `⚠️ Rollback: ${result.reason}<br>` +
+        `<div style="margin-top:10px; font-size:12px; color:#ddd;">Original text (copy if needed):</div>` +
+        `<textarea style="width:100%; height:60px; margin-top:4px; padding:6px; background:#333; color:#fff; border:1px solid #555; border-radius:4px; font-family:monospace; resize:vertical; user-select:text; -webkit-user-select:text; cursor:text;" onfocus="this.select()">${context.original}</textarea>`,
+        true
+      );
+    }
+  } finally {
+    isConverting = false;
+  }
+}
+
+// ===== KEYBOARD HANDLER =====
+
+function onKey(e) {
+  if (!guide || !e.isTrusted) return;
+  const active = document.activeElement;
+  if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
 
   if (e.key === "Escape") {
     e.preventDefault();
-    if (settingsOpen) {
-      settingsOpen = false;
-      goStep(0);
-    } else {
-      // Restore dollar signs if we stripped them but user didn't convert
-      if (guide.pendingRestore && guide.pendingRestore.tn.isConnected) {
-        const { latex, dollars } = guide.pendingRestore;
-        const sel = window.getSelection();
-        if (sel.rangeCount > 0) {
-          document.execCommand("insertText", false, dollars + latex + dollars);
-        }
-      }
-      stopGuide();
+    stopGuide(true);
+  }
+  else if ((e.key === "c" || e.key === "C") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    if (!guide.autoMode) {
+      convertCurrent();
     }
   }
-  else if ((e.key === "s" || e.key === "S") && !settingsOpen) {
+  else if ((e.key === "a" || e.key === "A") && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
-    showSettings();
-  }
-  else if (e.key === "a" || e.key === "A") {
-    if (settingsOpen) return;
-    e.preventDefault();
-
-    // Clear any checker since we're switching modes
-    if (guide.checker) clearInterval(guide.checker);
-
-    // Restore dollar signs if we stripped them in manual mode
-    if (guide.pendingRestore && guide.pendingRestore.tn.isConnected && !guide.autoMode) {
-      const { latex, dollars } = guide.pendingRestore;
-      const sel = window.getSelection();
-      if (sel.rangeCount > 0) {
-        document.execCommand("insertText", false, dollars + latex + dollars);
-      }
-    }
-    guide.pendingRestore = null;
-
     guide.autoMode = !guide.autoMode;
-    setTimeout(() => goStep(0), 50);
-  }
-  else if (e.key === "ArrowRight") {
-    if (settingsOpen) return;
-    e.preventDefault();
-
-    // Restore dollar signs before skipping
-    if (guide.pendingRestore && guide.pendingRestore.tn.isConnected) {
-      const { latex, dollars } = guide.pendingRestore;
-      const sel = window.getSelection();
-      if (sel.rangeCount > 0) {
-        document.execCommand("insertText", false, dollars + latex + dollars);
-      }
-    }
-    guide.pendingRestore = null;
-
-    const item = guide.items[guide.index];
-    if (item?.tn) ignoredNodes.add(item.tn);
     setTimeout(() => goStep(0), 10);
   }
-  else if (e.key === "Enter" && !guide.autoMode) {
-    if (settingsOpen) return;
+  else if (e.key === "ArrowRight") {
     e.preventDefault();
-    if (guide.checker) clearInterval(guide.checker);
-    closeNotionDialog();
-    setTimeout(() => goStep(0), 50);
+    // Skip this equation
+    const item = guide.items[guide.index];
+    if (item) {
+      const context = captureContext(item.tn, item.span);
+      logConversion(context.original, context.latex, context.isBlock ? "block" : "inline", "skipped");
+    }
+    setTimeout(() => goStep(1), 10);
   }
 }
 
-// ENTRY POINT
+// ===== ENTRY POINT =====
+
 async function runGuided() {
-  ignoredNodes = new WeakSet();
+  console.log("[NotionTeX] runGuided() called");
+  conversionLog.length = 0;
 
   const items = collectItems();
+  console.log("[NotionTeX] Found", items.length, "equations");
   if (!items.length) {
     showNotification("No equations found", true);
     return;
   }
 
-  guide = { items, index: 0, checker: null, autoMode: false };
+  guide = { items, index: 0, autoMode: false };
 
   window.addEventListener("keydown", onKey, true);
 
@@ -737,5 +943,6 @@ async function runGuided() {
 }
 
 chrome.runtime.onMessage.addListener(m => {
+  console.log("[NotionTeX] Message received:", m);
   if (m?.t === "RUN_CONVERT") runGuided();
 });

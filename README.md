@@ -19,9 +19,9 @@ A Chrome extension that converts LaTeX-style math notation (`$...$` for inline a
 
 - **Dual Equation Support**: Converts both inline (`$...$`) and block (`$$...$$`) equations
 - **Two Conversion Modes**:
-  - **Manual Mode**: Navigate equations one-by-one and convert with `Ctrl+Shift+E`
+  - **Manual Mode**: Navigate equations one-by-one and convert with the `C` key
   - **Auto Mode**: Automatically converts all detected equations in sequence
-- **Adjustable Speed Settings**: Configure timing delays via the HUD for different computer speeds
+- **Dynamic DOM Synchronization**: The extension is powered by dynamic DOM polling. It automatically adjusts to your computer's speed and internet connection, waiting for Notion's React state to render before proceeding.
 - **Visual Feedback**: On-screen HUD shows progress, current mode, and keyboard shortcuts
 - **Non-Destructive Workflow**: Equations are only modified when you commit to conversion
 - **Context-Aware**: Ignores equations already converted or inside code blocks
@@ -60,24 +60,10 @@ Once activated, a HUD appears showing the first equation. Use these controls:
 
 | Action | Shortcut | Description |
 |:-------|:---------|:------------|
-| Convert | `Ctrl + Shift + E` | Converts the highlighted equation |
+| Convert | `C` | Converts the currently highlighted equation |
 | Auto Mode | `A` | Toggle automatic conversion of all equations |
 | Skip | `→` (Arrow Right) | Skip to the next equation |
-| Speed Settings | `S` | Open speed configuration panel |
 | Exit | `Esc` | Close the extension (restores any uncommitted changes) |
-
-### Speed Settings
-
-Press `S` to open the speed settings panel. Choose a preset or set custom values:
-
-| Preset | Menu Wait | Input Wait | Typing | Use Case |
-|:-------|:----------|:-----------|:-------|:---------|
-| Fast | 50ms | 25ms | 5ms | Fast computers |
-| Normal | 100ms | 50ms | 10ms | Default |
-| Slow | 200ms | 100ms | 20ms | Slower computers |
-| Very Slow | 400ms | 200ms | 40ms | If experiencing issues |
-
-Settings are saved automatically and persist between sessions.
 
 ## How It Works
 
@@ -90,8 +76,9 @@ The extension operates through two components:
 **Content Script** (`src/content.js`)
 - Scans Notion's DOM for text nodes containing LaTeX delimiters
 - Creates visual overlays to highlight detected equations
-- Manages the conversion workflow using Notion's native commands
-- Handles both `/inlinemath` and `/math` slash commands for respective equation types
+- Manages the conversion workflow using robust native browser commands:
+  - **Inline Math**: Wraps the text and safely triggers Notion's native inline equation global shortcut (`Ctrl+Shift+E`).
+  - **Block Math**: Selects the target, precisely positions the cursor, and injects `/block eq` to trigger Notion's slash menu.
 
 ## Technical Details
 
@@ -107,6 +94,7 @@ The extension operates through two components:
 - Only works on `notion.so` and `*.notion.site` domains
 - Requires the Notion page to be fully loaded before activation
 - Nested or malformed delimiters may produce unexpected results
+- Equations embedded tightly within complex text blocks without spaces may occasionally fail to trigger Notion's slash menu.
 - This extension can not be used in the Notion Desktop app (from what I am aware of)
 
 ## About This Project
