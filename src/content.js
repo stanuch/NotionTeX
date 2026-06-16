@@ -139,14 +139,14 @@ async function undoOperations(count = 10) {
  * Captures the surrounding context of an equation before conversion.
  * Used to verify that adjacent punctuation is preserved after conversion.
  */
-function captureContext(tn, span) {
+function captureContext(item) {
   return {
-    fullText: tn.nodeValue,
-    charBefore: span.open > 0 ? tn.nodeValue.charAt(span.open - 1) : null,
-    charAfter: span.close < tn.nodeValue.length ? tn.nodeValue.charAt(span.close) : null,
-    latex: tn.nodeValue.substring(span.innerStart, span.innerEnd),
-    original: tn.nodeValue.substring(span.open, span.close),
-    isBlock: span.dbl,
+    fullText: item.text,
+    charBefore: item.span.open > 0 ? item.text.charAt(item.span.open - 1) : null,
+    charAfter: item.span.close < item.text.length ? item.text.charAt(item.span.close) : null,
+    latex: item.text.substring(item.span.innerStart, item.span.innerEnd),
+    original: item.text.substring(item.span.open, item.span.close),
+    isBlock: item.span.dbl,
   };
 }
 
@@ -264,6 +264,27 @@ function findDollarSpans(text) {
 
 // ===== EQUATION COLLECTION =====
 
+function getBlockTextAndMap(blockElement) {
+  let text = "";
+  const map = [];
+  const walker = document.createTreeWalker(blockElement, NodeFilter.SHOW_TEXT, null, false);
+  let tn;
+  while ((tn = walker.nextNode())) {
+    const val = tn.nodeValue;
+    for (let i = 0; i < val.length; i++) {
+      map.push({ node: tn, offset: i });
+    }
+    text += val;
+  }
+  if (map.length > 0) {
+    const last = map[map.length - 1];
+    map.push({ node: last.node, offset: last.offset + 1 });
+  } else {
+    map.push({ node: blockElement, offset: 0 });
+  }
+  return { text, map };
+}
+
 function collectItems() {
   const items = [];
   const roots = new Set();
@@ -271,13 +292,30 @@ function collectItems() {
   for (const s of ROOTS) document.querySelectorAll(s).forEach(n => roots.add(n));
   if (!roots.size) roots.add(document.body);
 
-  const visitedNodes = new Set();
+  const visitedBlocks = new Set();
   for (const root of roots) {
-    for (const tn of textNodes(root)) {
-      if (visitedNodes.has(tn)) continue;
-      visitedNodes.add(tn);
-      const spans = findDollarSpans(tn.nodeValue);
-      spans.forEach(span => items.push({ tn, span }));
+    const blocks = root.querySelectorAll('[contenteditable="true"]');
+    for (const block of blocks) {
+      if (visitedBlocks.has(block)) continue;
+      visitedBlocks.add(block);
+
+      if (!block.textContent.includes('$')) continue;
+      if (block.closest('.notion-code-block, pre, code')) continue;
+
+      const { text, map } = getBlockTextAndMap(block);
+      const spans = findDollarSpans(text);
+      
+      spans.forEach(span => {
+        const start = map[span.open];
+        const end = map[span.close];
+        if (start && end) {
+          items.push({
+            block, text, map, span,
+            startNode: start.node, startOffset: start.offset,
+            endNode: end.node, endOffset: end.offset
+          });
+        }
+      });
     }
   }
   return items;
@@ -292,12 +330,12 @@ function focusEditableFrom(node) {
   return null;
 }
 
-function setSelectionInTextNode(node, start, end) {
+function setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset) {
   const sel = window.getSelection();
   const r = document.createRange();
   try {
-    r.setStart(node, start);
-    r.setEnd(node, end);
+    r.setStart(startNode, startOffset);
+    r.setEnd(endNode, endOffset);
     sel.removeAllRanges();
     sel.addRange(r);
   } catch (e) { return null; }
@@ -479,8 +517,9 @@ const hideHUD = () => {
  * @param {object} span - The span object from findDollarSpans
  * @returns {{ success: boolean, reason?: string }}
  */
-async function convertEquation(tn, span) {
-  const latex = tn.nodeValue.substring(span.innerStart, span.innerEnd);
+async function convertEquation(item) {
+  const { startNode, startOffset, endNode, endOffset, span, text } = item;
+  const latex = text.substring(span.innerStart, span.innerEnd);
   const isBlock = span.dbl;
   const command = isBlock ? "/math" : "/inlinemath";
   let inputField = null;
@@ -504,8 +543,8 @@ async function convertEquation(tn, span) {
 
   if (!isBlock) {
     // INLINE MATH: Wrap selection with Ctrl+Shift+E, then overwrite
-    activateNode(tn.parentElement);
-    const r = setSelectionInTextNode(tn, span.open, span.close);
+    activateNode(startNode.parentElement);
+    const r = setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset);
     if (!r) return { success: false, reason: "selection_failed" };
 
     const prevActive = document.activeElement;
@@ -533,21 +572,21 @@ async function convertEquation(tn, span) {
   } else {
     // BLOCK MATH
 
-    activateNode(tn.parentElement);
-    await waitForCondition(() => document.activeElement && document.activeElement.contains(tn.parentElement), 2000);
+    activateNode(startNode.parentElement);
+    await waitForCondition(() => document.activeElement && document.activeElement.contains(startNode.parentElement), 2000);
     await sleep(20); // Wait for React to complete its async focus-restore
 
     // Dispatch a harmless key to wake up Notion's event listeners
     dispatchKey(document.activeElement, "Shift", "ShiftLeft", 16);
     await sleep(10);
 
-    const r = setSelectionInTextNode(tn, span.open, span.close);
+    const r = setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset);
     if (!r) return { success: false, reason: "selection_failed" };
 
     // Force React to recognize the new native DOM selection
     document.dispatchEvent(new Event("selectionchange"));
-    if (tn.parentElement) {
-      tn.parentElement.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+    if (startNode.parentElement) {
+      startNode.parentElement.dispatchEvent(new Event("selectionchange", { bubbles: true }));
     }
     await sleep(30); // Wait for React to digest the selection change
 
@@ -761,32 +800,32 @@ async function goStep(delta) {
 
   guide.index = i;
   const item = items[i];
-  const { tn, span } = item;
+  const { startNode, endNode, startOffset, endOffset, span } = item;
 
   // Ensure the text node is still in the DOM
-  if (!tn.isConnected) {
+  if (!startNode.isConnected) {
     guide.index = 0;
     setTimeout(() => goStep(0), 10);
     return;
   }
 
   // Scroll into view if off-screen (prevents Notion from unmounting virtualized nodes during focus)
-  if (tn.parentElement) {
-    const rect = tn.parentElement.getBoundingClientRect();
+  if (startNode.parentElement) {
+    const rect = startNode.parentElement.getBoundingClientRect();
     const inView = rect.top >= 150 && rect.bottom <= window.innerHeight - 150;
     if (!inView) {
-      tn.parentElement.scrollIntoView({ block: "center" });
+      startNode.parentElement.scrollIntoView({ block: "center" });
       await sleep(100); // Give Notion time to render virtualized lists
 
       // After scrolling, React might have recreated the text node!
-      if (!tn.isConnected) {
+      if (!startNode.isConnected) {
         setTimeout(() => goStep(0), 10);
         return;
       }
     }
   }
 
-  if (!focusEditableFrom(tn)) {
+  if (!focusEditableFrom(startNode)) {
     guide.index = 0;
     setTimeout(() => goStep(0), 10);
     return;
@@ -804,7 +843,7 @@ async function goStep(delta) {
 
     try {
       // Highlight briefly for visual feedback
-      const r = setSelectionInTextNode(tn, span.open, span.close);
+      const r = setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset);
       if (!r) { setTimeout(() => goStep(0), 0); return; }
 
       const color = isBlock ? "#60a5fa" : "#4ade80";
@@ -815,10 +854,10 @@ async function goStep(delta) {
       await sleep(150);
 
       // Capture context for punctuation protection
-      const context = captureContext(tn, span);
+      const context = captureContext(item);
 
       // convertEquation handles select → delete → convert → verify → rollback
-      const result = await convertEquation(tn, span);
+      const result = await convertEquation(item);
       if (!guide) return;
 
       if (result.success) {
@@ -843,7 +882,7 @@ async function goStep(delta) {
   }
 
   // NON-AUTO MODE — just highlight, don't modify DOM
-  const r = setSelectionInTextNode(tn, span.open, span.close);
+  const r = setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset);
   if (!r) { setTimeout(() => goStep(1), 0); return; }
 
   const color = isBlock ? "#60a5fa" : "#4ade80";
@@ -860,16 +899,16 @@ async function convertCurrent() {
   const item = guide.items[guide.index];
   if (!item) return;
 
-  const { tn, span } = item;
-  if (!tn.isConnected) { goStep(0); return; }
+  const { startNode, endNode, startOffset, endOffset, span } = item;
+  if (!startNode.isConnected) { goStep(0); return; }
 
   isConverting = true;
   try {
     const isBlock = span.dbl;
-    const context = captureContext(tn, span);
+    const context = captureContext(item);
 
     // convertEquation handles select → delete → convert → verify → rollback
-    const result = await convertEquation(tn, span);
+    const result = await convertEquation(item);
 
     if (result.success) {
       logConversion(context.original, context.latex, isBlock ? "block" : "inline", "success");
