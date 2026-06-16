@@ -6,7 +6,6 @@ A Chrome extension that converts LaTeX-style math notation (`$...$` for inline a
 
 ![Latest Release](https://img.shields.io/github/v/release/stanuch/NotionTeX?label=Latest%20Release)
 ![Codebase Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fstanuch%2FNotionTeX%2Fmain%2Fmanifest.json&query=%24.version&label=Codebase%20Version&color=blue)
-![Release Date](https://img.shields.io/github/release-date/stanuch/NotionTeX?label=Latest%20Release)
 ![Newest commit](https://img.shields.io/github/last-commit/stanuch/NotionTeX?label=Newest%20Commit)
 ![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
 ![Notion](https://img.shields.io/badge/Notion-000000?logo=notion&logoColor=white)
