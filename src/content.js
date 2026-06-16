@@ -299,6 +299,9 @@ function collectItems() {
       if (visitedBlocks.has(block)) continue;
       visitedBlocks.add(block);
 
+      // Skip wrapper blocks (blocks that contain other editable blocks) to prevent double counting
+      if (block.querySelector('[contenteditable="true"]')) continue;
+
       if (!block.textContent.includes('$')) continue;
       if (block.closest('.notion-code-block, pre, code')) continue;
 
@@ -857,8 +860,21 @@ async function goStep(delta) {
       const context = captureContext(item);
 
       // convertEquation handles select → delete → convert → verify → rollback
-      const result = await convertEquation(item);
+      let result = await convertEquation(item);
       if (!guide) return;
+
+      if (!result.success) {
+        // Retry exactly once on failure (React sometimes randomly drops synthetic events)
+        console.warn(`Conversion failed (${result.reason}), retrying once...`);
+        await sleep(300);
+        
+        // Re-highlight the item (it might have lost focus during rollback)
+        setSelectionAcrossNodes(startNode, startOffset, endNode, endOffset);
+        await sleep(50);
+        
+        result = await convertEquation(item);
+        if (!guide) return;
+      }
 
       if (result.success) {
         logConversion(context.original, context.latex, isBlock ? "block" : "inline", "success");
@@ -954,7 +970,7 @@ function onKey(e) {
     // Skip this equation
     const item = guide.items[guide.index];
     if (item) {
-      const context = captureContext(item.tn, item.span);
+      const context = captureContext(item);
       logConversion(context.original, context.latex, context.isBlock ? "block" : "inline", "skipped");
     }
     setTimeout(() => goStep(1), 10);
