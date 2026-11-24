@@ -13,7 +13,8 @@ A Chrome extension that converts LaTeX-style math notation (`$...$` for inline a
 ![Manifest](https://img.shields.io/badge/Manifest-V3-2ea44f?logo=google-chrome&logoColor=white)
 ![AI Assisted](https://img.shields.io/badge/Built_with-AI-blueviolet?style=flat)
 
-> **Note:** The **Codebase Version** reflects the most recent updates on the `main` branch (which you get by downloading the repository directly), and it might be newer than the **Latest Release** version if I haven't published a new release yet.
+> [!NOTE]
+> **STATUS:** The project will not be updated, since I'm not using Notion anymore. The newest version is v3.0.1. Not perfect, but does the job most of the time. Feel free to develop it further.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/ec9a2651-ff92-4390-be0c-c288ce50515e" width="100%" controls="controls" muted="muted" autoplay="autoplay">
